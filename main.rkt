@@ -9,6 +9,7 @@
          racket/port
          racket/match
          racket/format
+         racket/string
          ffi/unsafe
          ffi/unsafe/define)
 
@@ -91,20 +92,54 @@
                           [c_ospeed _speed_t]))
 (define (new-termios) (make-termios 0 0 0 0 (make-vector NCCS 0) 0 0))
 
+(define-cstruct _winsize ([ws_row    _ushort]
+                          [ws_col    _ushort]
+                          [ws_xpixel _ushort]
+                          [ws_ypixel _ushort]))
+(define (new-winsize) (make-winsize 0 0 0 0))
+
+(define IOCPARM_MASK #x1fff)
+(define IOC_OUT #x40000000)
+(define (_IOC inout group num len)
+  (bitwise-ior inout num (arithmetic-shift group 8)
+               (arithmetic-shift (bitwise-and len IOCPARM_MASK) 16)))
+(define (_IOR g n t)
+  (_IOC IOC_OUT g n (ctype-sizeof t)))
+(define TIOCGWINSZ (_IOR (char->integer #\t) 104 _winsize))
 (define-ffi-definer define-libc (ffi-lib "libc"))
+(define interfaces (make-hash))
 
 (define-libc tcsetattr (_fun _int _int _termios-pointer -> _int))
 (define-libc tcgetattr (_fun _int _termios-pointer -> _int))
 (define-libc isatty (_fun _int -> _int))
+(define (ioctl fildes request . args)
+  (define itypes (list* _int _ulong
+                        (map
+                         (lambda (x)
+                           (cond
+                            [(winsize? x) _winsize-pointer]
+                            [else (error 'ioctl
+                                         "don't know how to deal with ~e" x)]))
+                         args)))
+  (define ioctl* (hash-ref interfaces itypes
+                           (lambda ()
+                             (let ([i (get-ffi-obj "ioctl" #f
+                                                   (_cprocedure itypes _int))])
+                               (hash-set! interfaces itypes i)
+                               i))))
+  (apply ioctl* fildes request args))
 
-(define (read-response [port (current-input-port)])
+(define (read-response [port stdin])
   (let loop ([acc ""])
     (define x (read-char))
-    (define acc* (string-append acc (~a x)))
-    (if (equal? x #\R)
-        acc*
-        (loop acc*))))
+    (cond [(eof-object? x) x]
+          [else (define acc* (string-append acc (~a x)))
+                (if (equal? x #\R)
+                    acc*
+                    (loop acc*))])))
 
+(define stdin (current-input-port))
+(define stdout (current-output-port))
 (define unsupported-terminals (set "dumb" "cons256" "emacs"))
 (define history-max-length 100)
 (define history '())
@@ -112,19 +147,22 @@
 (define raw-mode #f)
 (define multi-line-mode #f)
 (define at-exit-handler #f)
+(define completion-callback (lambda (str completions) (void)))
 
 (struct line-edit-state (input-file
+                         output-file
                          buffer
                          prompt
                          cursor-position
                          previous-cursor-position
+                         length
                          columns
                          max-rows
                          history-index))
 
 (define (line-editor prompt [reader read])
   (cond
-   [(and (supported-terminal?) (terminal-port? (current-input-port))
+   [(and (supported-terminal?) (terminal-port? stdin)
          (enable-raw-mode STDIN_FILENO))
     (define out (edit prompt STDIN_FILENO))
     (disable-raw-mode STDIN_FILENO)
@@ -134,8 +172,8 @@
          (flush-output)
          (reader)]))
 
-#;(define (set-completion-callback callback)
-  ...)
+(define (set-completion-callback callback)
+  (set! completion-callback callback))
 
 #;(define (add-completion completions str)
   ...)
@@ -204,26 +242,69 @@
   (when (and raw-mode (tcsetattr file TCSAFLUSH original-termios))
     (set! raw-mode #f)))
 
-(define (get-columns in-file)
+(define (get-columns [in stdin] [out stdout])
+  (let/ec return
+    (define ws (new-winsize))
+    (cond
+     [(or (= (ioctl 1 TIOCGWINSZ ws) -1)
+          (= (winsize-ws_col ws) 0))
+      ;; Initial position, to be restored later
+      (define start (get-cursor-position in out))
+      (unless start (return 80))
+
+      ;; Go to right margin
+      (display "\x1b[999C" out)
+      (define cols (get-cursor-position in out))
+      (unless cols (return 80))
+
+      ;; Restore potion
+      (display (format "\x1b[~aD" (- cols start)))
+      cols]
+     [else (winsize-ws_col ws)])))
+
+(define (get-cursor-position [in stdin] [out stdout])
+  (display "\x1b[6n" out)
+  (define pos (read-response in))
+  (cond
+   [(eof-object? pos) #f]
+   [(and (equal? (string-ref pos 0) #\u001B)
+         (equal? (string-ref pos 1) #\[)
+         (equal? (string-ref pos (- (string-length pos) 1)) #\R))
+    (define pos* (substring pos 2 (- (string-length pos) 1)))
+    (string-split pos* ";")]
+   [else #f]))
+
+(define (complete-line state)
   (void))
 
-(define (edit prompt in-file)
-  (line-edit-state in-file "" prompt 0 0 0
-                   (get-columns in-file) 0 0)
+(define (edit prompt [in stdin] [out stdout])
+  (define state (line-edit-state in out "" prompt 0 0 0 0
+                                 (get-columns in) 0 0))
   (history-add "")
-  (display prompt)
-
-  (void))
-
-;;(file-stream-buffer-mode (current-input-port) 'none)
-;;(file-stream-buffer-mode (current-output-port) 'none)
-(void (enable-raw-mode))
-(display "\x1b[6n")
-(flush-output)
-(define response (read-response))
-(void (disable-raw-mode))
-response
+  (display prompt out)
+  (let/ec return
+    (let loop ()
+      (define c (read-char in))
+      (when (eof-object? c) (return (line-edit-state-length state)))
+      (when (equal? c #\tab)
+        (void)))))
 
 (module+ test
-  ;; Tests to be run with raco test
-  )
+  (check-true
+   (< 0
+      (let ()
+        (file-stream-buffer-mode (current-input-port) 'none)
+        (file-stream-buffer-mode (current-output-port) 'none)
+        (void (enable-raw-mode))
+        (define cols (get-columns))
+        (void (disable-raw-mode))
+        cols))
+   (check-true
+    (pair?
+     (let ()
+       (file-stream-buffer-mode (current-input-port) 'none)
+       (file-stream-buffer-mode (current-output-port) 'none)
+       (void (enable-raw-mode))
+       (define x (get-cursor-position))
+       (void (disable-raw-mode))
+       x)))))
