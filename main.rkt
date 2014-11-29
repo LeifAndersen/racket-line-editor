@@ -140,6 +140,7 @@
 
 (define stdin (current-input-port))
 (define stdout (current-output-port))
+(define stderr (current-error-port))
 (define unsupported-terminals (set "dumb" "cons256" "emacs"))
 (define history-max-length 100)
 (define history '())
@@ -147,18 +148,19 @@
 (define raw-mode #f)
 (define multi-line-mode #f)
 (define at-exit-handler #f)
-(define completion-callback (lambda (str completions) (void)))
+(define completion-callback (lambda (stub) '()))
 
-(struct line-edit-state (input-file
-                         output-file
-                         buffer
-                         prompt
-                         cursor-position
-                         previous-cursor-position
-                         length
-                         columns
-                         max-rows
-                         history-index))
+(struct le-state (in
+                  out
+                  buffer
+                  prompt
+                  pos
+                  old-pos
+                  len
+                  columns
+                  rows
+                  history-index)
+        #:mutable)
 
 (define (line-editor prompt [reader read])
   (cond
@@ -174,9 +176,6 @@
 
 (define (set-completion-callback callback)
   (set! completion-callback callback))
-
-#;(define (add-completion completions str)
-  ...)
 
 (define (history-add line)
   (define new-history (cons line history))
@@ -258,7 +257,7 @@
       (unless cols (return 80))
 
       ;; Restore potion
-      (display (format "\x1b[~aD" (- cols start)))
+      (fprintf out "\x1b[~aD" (- (second cols) (second start)))
       cols]
      [else (winsize-ws_col ws)])))
 
@@ -274,18 +273,97 @@
     (string-split pos* ";")]
    [else #f]))
 
-(define (complete-line state)
-  (void))
+(define (complete-line! state)
+  (let/ec return
+    (define completions (completion-callback))
+    (cond
+     [(null? completions) (display "\x7" stderr)] ; Beep
+     [else
+      (let loop ([i 0])
+        (define item
+          (cond [(i . < . (length completions)) (list-ref completions i)]
+                [else (display "\x7" stderr)
+                      #f]))
+        (cond [item
+               (define saved (struct-copy le-state state))
+               (set-le-state-len! state (string-length item))
+               (set-le-state-pos! state (string-length item))
+               (set-le-state-buffer! state item)
+               (refresh-line! state)
+               (set-le-state-len! state (le-state-len saved))
+               (set-le-state-pos! state (le-state-pos saved))
+               (set-le-state-buffer! state (le-state-buffer saved))]
+              [else
+               (refresh-line! state)])
+        (match (read-char (le-state-in state))
+          [#\tab (loop (modulo (+ i 1) (+ (length completions) 1)))]
+          [#\u1b (when item (refresh-line! state))]                ; escape
+          [else
+           (when item
+             (set-le-state-buffer! state item)
+             (set-le-state-len! state (string-length item))
+             (set-le-state-pos! state (string-length item)))]))])))
+
+(define (refresh-line! state)
+  (define out (le-state-out state))
+  (define prompt (le-state-prompt state))
+  (define buffer (le-state-buffer state))
+  (define columns (le-state-columns state))
+  (define old-rows (le-state-rows state))
+  (define pos (le-state-pos state))
+  (define old-pos (le-state-old-pos state))
+  (define len (le-state-len state))
+  (cond
+   [multi-line-mode
+    (define rows (/ (+ (string-length prompt) columns -1) columns))
+    (define rpos (/ (+ (string-length prompt) old-pos columns -1) columns))
+
+    ;; Go to the last row
+    (when (rows . > . rpos)
+      (fprintf out "\x1b[~aB"
+               (- rows rpos)))
+
+    ;; Clear every row
+    (for ([j (in-range old-rows)])
+      (display "\r\x1b[0K\x1b[1A" out))
+
+    ;; Clear the top line
+    (display "\r\x1b[0K")
+
+    ;; Write prompt and current buffer
+    (fprintf out "~a~a" prompt buffer)
+
+    ;; If at end of screen, emit newline
+    (when (and (equal? pos len)
+               (= (modulo (+ pos (string-length prompt)) columns) 0))
+      (display "\n\r" out)
+      (set! rows (+ rows 1)))
+
+    ;; Move cursor to correct position
+    (define rpos* (/ (+ (string-length prompt) pos columns) columns))
+    (when (rows . > . rpos*)
+      (fprintf out "\x1b[~aA" (- rows rpos*)))
+    (define col (modulo (+ (string-length prompt)) columns))
+    (if (col . > . 0)
+        (fprintf out "\r\x1b[~aC" col)
+        (display "\r" out))
+
+    (set-le-state-old-pos! state pos)
+    (when (rows . > . old-rows) (set-le-state-rows! state rows))]
+
+   [else ; Go to left, print prompt and buffer, clear rest of line
+    (fprintf out "\r~a~a\x1b[0K\r\x1b[~aC"
+             prompt buffer (+ (string-length prompt) (string-length buffer)))]))
 
 (define (edit prompt [in stdin] [out stdout])
-  (define state (line-edit-state in out "" prompt 0 0 0 0
+  (define state (le-state in out "" prompt 0 0 0 0
                                  (get-columns in) 0 0))
   (history-add "")
   (display prompt out)
   (let/ec return
     (let loop ()
       (define c (read-char in))
-      (when (eof-object? c) (return (line-edit-state-length state)))
+      (when (eof-object? c) (return (le-state-len state)))
       (when (equal? c #\tab)
         (void)))))
 
