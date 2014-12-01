@@ -1,6 +1,9 @@
 #lang racket/base
 
-(provide set-multi-line-mode)
+#;
+(provide set-multi-line-mode
+         line-editor)
+(provide (all-defined-out))
 
 (require racket/set
          racket/list
@@ -138,6 +141,14 @@
                     acc*
                     (loop acc*))])))
 
+(define key-null  #\null)
+(define ctrl-a    #\u1)
+(define ctrl-e    #\u5)
+(define tab       #\tab)
+(define ctrl-k    #\ub)
+(define ctrl-l    #\uc)
+(define ctrl-u    #\u15)
+
 (define stdin (current-input-port))
 (define stdout (current-output-port))
 (define stderr (current-error-port))
@@ -162,11 +173,13 @@
                   history-index)
         #:mutable)
 
-(define (line-editor prompt [reader read])
+(define (line-editor prompt [reader read-line])
+  (file-stream-buffer-mode stdin 'none)
+  (file-stream-buffer-mode stdout 'none)
   (cond
    [(and (supported-terminal?) (terminal-port? stdin)
          (enable-raw-mode STDIN_FILENO))
-    (define out (edit prompt STDIN_FILENO))
+    (define out (edit prompt stdin))
     (disable-raw-mode STDIN_FILENO)
     (newline)
     out]
@@ -202,13 +215,10 @@
 (define (set-multi-line-mode multi-line)
   (set! multi-line-mode multi-line))
 
-#;(define (print-key-codes)
-  ...)
-
 (define (supported-terminal?)
   (define terminal (getenv "TERM"))
   (and terminal
-       (set-member? unsupported-terminals) terminal))
+       (not (set-member? unsupported-terminals terminal))))
 
 (define (enable-raw-mode [file STDIN_FILENO])
   (let/ec return
@@ -228,10 +238,9 @@
        (bitwise-ior CS8 (termios-c_cflag original-termios))
        (bitwise-and (bitwise-not (bitwise-ior ECHO ICANON IEXTEN ISIG))
                     (termios-c_lflag original-termios))
-       (build-vector NCCS (lambda (n) (match n
-                                        [VMIN 1]
-                                        [VTIME 0]
-                                        [else 0])))
+       (build-vector NCCS (lambda (n) (cond [(equal? n VMIN) 1]
+                                            [(equal? n VTIME) 0]
+                                            [else 0])))
        0 0))
     (unless (= (tcsetattr file TCSAFLUSH raw) 0) (return #f))
     (set! raw-mode #t)
@@ -274,35 +283,35 @@
    [else #f]))
 
 (define (complete-line! state)
-  (let/ec return
-    (define completions (completion-callback))
-    (cond
-     [(null? completions) (display "\x7" stderr)] ; Beep
-     [else
-      (let loop ([i 0])
-        (define item
-          (cond [(i . < . (length completions)) (list-ref completions i)]
-                [else (display "\x7" stderr)
-                      #f]))
-        (cond [item
-               (define saved (struct-copy le-state state))
-               (set-le-state-len! state (string-length item))
-               (set-le-state-pos! state (string-length item))
-               (set-le-state-buffer! state item)
-               (refresh-line! state)
-               (set-le-state-len! state (le-state-len saved))
-               (set-le-state-pos! state (le-state-pos saved))
-               (set-le-state-buffer! state (le-state-buffer saved))]
-              [else
-               (refresh-line! state)])
-        (match (read-char (le-state-in state))
-          [#\tab (loop (modulo (+ i 1) (+ (length completions) 1)))]
-          [#\u1b (when item (refresh-line! state))]                ; escape
-          [else
-           (when item
-             (set-le-state-buffer! state item)
+  (define completions (completion-callback))
+  (cond
+   [(null? completions) (display "\x7" stderr)] ; Beep
+   [else
+    (let loop ([i 0])
+      (define item
+        (cond [(i . < . (length completions)) (list-ref completions i)]
+              [else (display "\x7" stderr)
+                    #f]))
+      (cond [item
+             (define saved (struct-copy le-state state))
              (set-le-state-len! state (string-length item))
-             (set-le-state-pos! state (string-length item)))]))])))
+             (set-le-state-pos! state (string-length item))
+             (set-le-state-buffer! state item)
+             (refresh-line! state)
+             (set-le-state-len! state (le-state-len saved))
+             (set-le-state-pos! state (le-state-pos saved))
+             (set-le-state-buffer! state (le-state-buffer saved))]
+            [else
+             (refresh-line! state)])
+      (match (read-char (le-state-in state))
+        [#\tab (loop (modulo (+ i 1) (+ (length completions) 1)))]
+        [#\u1b (when item (refresh-line! state))]                ; escape
+        [else
+         (when item
+           (set-le-state-buffer! state item)
+           (set-le-state-len! state (string-length item))
+           (set-le-state-pos! state (string-length item)))])
+      (string-ref item (- (string-length item) 1)))]))
 
 (define (refresh-line! state)
   (define out (le-state-out state))
@@ -356,19 +365,146 @@
              prompt buffer (+ (string-length prompt) (string-length buffer)))]))
 
 (define (edit prompt [in stdin] [out stdout])
-  (define state (le-state in out "" prompt 0 0 0 0
-                                 (get-columns in) 0 0))
-  (history-add "")
-  (display prompt out)
   (let/ec return
+    (define state (le-state in out "" prompt 0 0 0 (get-columns in out) 0 0))
+    (history-add "")
+    (display prompt out)
     (let loop ()
       (define c (read-char in))
       (when (eof-object? c) (return (le-state-len state)))
       (when (equal? c #\tab)
-        (void)))))
+        (set! c (complete-line! state)))
+      (match c
+        [#\ud                                            ; enter
+         (set! history (take history (- (length history) 1)))
+         (when multi-line-mode (edit-move-end! state))]
+        [#\u3 (exit 130)]                                ; ctrl-c
+        [(or #\u8 #\u7f) (edit-backspace! state) (loop)] ; ctr-h or backspace
+        [#\u4                                            ; ctrl-d
+         (cond [((le-state-len state) . > . 0) (edit-delete! state) (loop)]
+               [else (set! history (take history (- (length history) 1)))
+                     eof])]
+        [#\u14                                           ; ctrl-t
+         (when (and ((le-state-pos state) . > . 0)
+                    ((le-state-pos state) . < . (le-state-len state)))
+           (define str (le-state-buffer state))
+           (define pos (le-state-pos state))
+           (define aux (string-ref str (- pos 1)))
+           (string-set! str (- pos 1) (string-ref str pos))
+           (string-set! str pos aux)
+           (when (not (= pos (- (le-state-len state) 1)))
+             (set-le-state-pos! state (+ pos 1)))
+           (refresh-line! state))
+         (loop)]
+        [#\u2 (edit-move-left! state) (loop)]            ; ctrl-b
+        [#\u6 (edit-move-right! state) (loop)]           ; ctrl-f
+        [#\u10 (edit-history-next! state 'prev) (loop)]   ; ctrl-p
+        [#\ue (edit-history-next! state 'next) (loop)]    ; ctrl-n
+        [#\u1b ; escape
+         (define x (read-char))
+         (define y (read-char))
+         (define z (and (equal? x #\[) (y . char>=? . #\0) (y . char<=? . #\9)
+                        (read-char)))
+         (match* (x y z)
+           [(#\[ #\3 #\~) (edit-delete! state)]           ; delete
+           [(#\[ #\A _) (edit-history-next! state 'prev)] ; up
+           [(#\[ #\B _) (edit-history-next! state 'next)] ; down
+           [(#\[ #\C _) (edit-move-right! state)]         ; right
+           [(#\[ #\D _) (edit-move-left! state)]          ; left
+           [(#\[ #\H _) (edit-move-home! state)]          ; home
+           [(#\[ #\F _) (edit-move-end! state)]           ; end
+           [(#\O #\H _) (edit-move-home! state)]          ; home
+           [(#\O #\F _) (edit-move-end! state)]           ; state
+           [(_ _ _)     (void)])                          ; not supported
+         (loop)]
+        [else (edit-insert! state c) (loop)]))
+    (le-state-buffer state)))
+
+(define (edit-move-home! state)
+  (unless (= (le-state-pos state) 0)
+    (set-le-state-pos! state 0)
+    (refresh-line! state)))
+
+(define (edit-move-end! state)
+  (unless (= (le-state-pos state) (le-state-len state))
+    (set-le-state-pos! state (le-state-len state))
+    (refresh-line! state)))
+
+(define (edit-backspace! state)
+  (when (and ((le-state-pos state) . > . 0) ((le-state-len state) . > . 0))
+    (set-le-state-pos! state (- (le-state-pos state) 1))
+    (set-le-state-len! state (- (le-state-len state) 1))
+    (let ([pos (le-state-pos state)]
+          [buf (le-state-buffer state)])
+      (set-le-state-buffer! state (string-append
+                                   (substring buf 0 pos)
+                                   (substring buf (+ pos 1) (string-length buf)))))
+    (refresh-line! state)))
+
+(define (edit-delete! state)
+  (when (and ((le-state-pos state) . > . 0)
+             ((le-state-len state) . > . (le-state-pos state)))
+    (set-le-state-len! state (- (le-state-len state) 1))
+    (let ([pos (le-state-pos state)]
+          [buf (le-state-buffer state)])
+      (set-le-state-buffer! state (string-append
+                                   (substring buf 0 pos)
+                                   (substring buf (+ pos 1) (string-length buf)))))
+    (refresh-line! state)))
+
+(define (edit-move-left! state)
+  (when ((le-state-pos state) . > . 0)
+    (set-le-state-pos! state (- (le-state-pos state) 1))
+    (refresh-line! state)))
+
+(define (edit-move-right! state)
+  (when (not (= (le-state-pos state) (le-state-len state)))
+    (set-le-state-pos! state (+ (le-state-pos state) 1))
+    (refresh-line! state)))
+
+(define (edit-history-next! state direction)
+  (define h-index (le-state-history-index state))
+  (set! history `(,@(take history h-index)
+                  ,(le-state-buffer state)
+                  ,@(drop history (+ h-index 1))))
+  (define new-index (+ (le-state-history-index state)
+                       (match direction ['next 1] ['prev -1])))
+  (cond
+   [(new-index . < . 0) (set-le-state-history-index! state 0)]
+   [(new-index . >= . (length history))
+    (set-le-state-history-index! state (- (length history) 1))]
+   [else
+    (set-le-state-history-index! state new-index)
+    (define new-text (list-ref history new-index))
+    (set-le-state-buffer! state new-text)
+    (set-le-state-len! state (string-length new-text))
+    (set-le-state-pos! state (string-length new-text))
+    (refresh-line! state)]))
+
+(define (edit-insert! state character)
+  (define len (le-state-len state))
+  (define pos (le-state-pos state))
+  (define buf (le-state-buffer state))
+  (cond
+   [(= len pos)
+    (set-le-state-buffer! state (string-append buf (string character)))
+    (set-le-state-pos! state (+ pos 1))
+    (set-le-state-len! state (+ len 1))
+    (if (and (not multi-line-mode)
+             ((string-length (le-state-prompt state)) . < . (le-state-columns state)))
+        (display character (le-state-out state))
+        (refresh-line! state))]
+   [else
+    (set-le-state-buffer! state (string-append
+                                 (substring buf 0 pos)
+                                 (string character)
+                                 (substring buf pos (string-length buf))))
+    (set-le-state-pos! state (+ pos 1))
+    (set-le-state-len! state (+ len 1))
+    (refresh-line! state)]))
 
 (module+ test
-  (check-true
+  (check-true ; Get columns
    (< 0
       (let ()
         (file-stream-buffer-mode (current-input-port) 'none)
@@ -376,13 +512,83 @@
         (void (enable-raw-mode))
         (define cols (get-columns))
         (void (disable-raw-mode))
-        cols))
-   (check-true
-    (pair?
-     (let ()
-       (file-stream-buffer-mode (current-input-port) 'none)
-       (file-stream-buffer-mode (current-output-port) 'none)
-       (void (enable-raw-mode))
-       (define x (get-cursor-position))
-       (void (disable-raw-mode))
-       x)))))
+        cols)))
+  (check-true ; Get cursor position
+   (pair?
+    (let ()
+      (file-stream-buffer-mode (current-input-port) 'none)
+      (file-stream-buffer-mode (current-output-port) 'none)
+      (void (enable-raw-mode))
+      (define x (get-cursor-position))
+      (void (disable-raw-mode))
+      x)))
+  (check-equal? ; Display prompt
+   (call-with-output-string
+    (lambda (stdout)
+      (file-stream-buffer-mode stdin 'none)
+      (void (enable-raw-mode))
+      (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
+      (refresh-line! state)
+      (void (disable-raw-mode))))
+   "\rfoo>\e[0K\r\e[4C")
+  (check-equal? ; type characters
+   (call-with-output-string
+    (lambda (stdout)
+      (file-stream-buffer-mode stdin 'none)
+      (void (enable-raw-mode))
+      (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
+      (edit-insert! state #\h)
+      (edit-insert! state #\e)
+      (edit-insert! state #\l)
+      (edit-insert! state #\l)
+      (edit-insert! state #\o)
+      (refresh-line! state)
+      (void (disable-raw-mode))))
+   "hello\rfoo>hello\e[0K\r\e[9C")
+  (check-equal? ; Backspace
+   (call-with-output-string
+    (lambda (stdout)
+      (file-stream-buffer-mode stdin 'none)
+      (void (enable-raw-mode))
+      (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
+      (edit-insert! state #\y)
+      (edit-insert! state #\e)
+      (edit-backspace! state)
+      (edit-backspace! state)
+      (edit-insert! state #\n)
+      (edit-insert! state #\o)
+      (refresh-line! state)
+      (void (disable-raw-mode))))
+   "ye\rfoo>y\e[0K\r\e[5C\rfoo>\e[0K\r\e[4Cno\rfoo>no\e[0K\r\e[6C")
+  (check-equal? ; left arrow key
+   (call-with-output-string
+    (lambda (stdout)
+      (file-stream-buffer-mode stdin 'none)
+      (void (enable-raw-mode))
+      (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
+      (edit-insert! state #\y)
+      (edit-insert! state #\s)
+      (edit-move-left! state)
+      (edit-insert! state #\e)
+      (refresh-line! state)
+      (void (disable-raw-mode))))
+   "ys\rfoo>ys\e[0K\r\e[6C\rfoo>yes\e[0K\r\e[7C\rfoo>yes\e[0K\r\e[7C")
+  (check-equal? ; cat
+   (call-with-output-string
+    (lambda (stdout)
+      (file-stream-buffer-mode stdin 'none)
+      (void (enable-raw-mode))
+      (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
+      (edit-insert! state #\o)
+      (edit-move-left! state)
+      (edit-insert! state #\a)
+      (edit-delete! state)
+      (edit-move-left! state)
+      (edit-insert! state #\c)
+      (edit-move-right! state)
+      (edit-insert! state #\t)
+      (refresh-line! state)
+      (void (disable-raw-mode))))
+   "o\rfoo>o\e[0K\r\e[5C\rfoo>ao\e[0K\r\e[6C\rfoo>a\e[0K\r\e[5C\rfoo>a\e[0K\r\e[5C\rfoo>ca\e[0K\r\e[6C\rfoo>ca\e[0K\r\e[6Ct\rfoo>cat\e[0K\r\e[7C")
+   )
+
