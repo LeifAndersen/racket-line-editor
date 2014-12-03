@@ -24,63 +24,20 @@
 (define VMIN 16)
 (define VTIME 17)
 
-(define TCSANOW    #x0)
-(define TCSADRAIN  #x1)
 (define TCSAFLUSH  #x2)
-(define TCSASOFT   #x10)
 
 (define _tcflag_t _ulong)
-(define IGNBRK      #x1)       ; Input
-(define BRKINT      #x2)
-(define IGNPAR      #x4)
-(define PARMRK      #x8)
+(define BRKINT      #x2)       ; Input
 (define INPCK       #x10)
 (define ISTRIP      #x20)
-(define INLCR       #x40)
-(define IGNCR       #x80)
 (define ICRNL       #x100)
 (define IXON        #x200)
-(define IXOFF       #x400)
-(define IXANY       #x800)
-(define IMAXBEL     #x2000)
 (define OPOST       #x1)       ; Output
-(define ONLCR       #x2)
-(define OXTABS      #x4)
-(define ONOEOT      #x8)
-(define CIGNORE     #x1)       ; Control
-(define CS5         #x0)
-(define CS6         #x100)
-(define CS7         #x200)
-(define CS8         #x300)
-(define CSTOPB      #x400)
-(define CREAD       #x800)
-(define PARENB      #x1000)
-(define PARODD      #x2000)
-(define HUPCL       #x4000)
-(define CLOCAL      #x8000)
-(define CCTS_OPLOW  #x10000)
-(define CRTSCTS     #x30000)
-(define CRTS_IFLOW  #x20000)
-(define CDTR_IFLOW  #x40000)
-(define CDSR_OFLOW  #x80000)
-(define CCAR_OFLOW  #x100000)
-(define MDMBUF      #x100000)
-(define ECHOKE      #x1)       ; Local
-(define ECHOE       #x2)
-(define ECHOK       #x4)
-(define ECHO        #x8)
-(define ECHONL      #x10)
-(define ECHOPRT     #x20)
-(define ECHOCTL     #x40)
+(define CS8         #x300)     ; Control
+(define ECHO        #x8)       ; Local
 (define ISIG        #x80)
 (define ICANON      #x100)
-(define ALTWERASE   #x200)
 (define IEXTEN      #x400)
-(define EXTPROC     #x800)
-(define TOSTOP      #x400000)
-(define FLUSHO      #x800000)
-(define NOKERNINFO  #x2000000)
-(define NOFLSH      #x8000000)
 
 (define _cc_t _ubyte)
 (define _speed_t _ulong)
@@ -93,13 +50,11 @@
                           [c_cc (_array/vector _cc_t NCCS)]
                           [c_ispeed _speed_t]
                           [c_ospeed _speed_t]))
-(define (new-termios) (make-termios 0 0 0 0 (make-vector NCCS 0) 0 0))
 
 (define-cstruct _winsize ([ws_row    _ushort]
                           [ws_col    _ushort]
                           [ws_xpixel _ushort]
                           [ws_ypixel _ushort]))
-(define (new-winsize) (make-winsize 0 0 0 0))
 
 (define IOCPARM_MASK #x1fff)
 (define IOC_OUT #x40000000)
@@ -109,6 +64,7 @@
 (define (_IOR g n t)
   (_IOC IOC_OUT g n (ctype-sizeof t)))
 (define TIOCGWINSZ (_IOR (char->integer #\t) 104 _winsize))
+
 (define-ffi-definer define-libc (ffi-lib "libc"))
 (define interfaces (make-hash))
 
@@ -141,21 +97,13 @@
                     acc*
                     (loop acc*))])))
 
-(define key-null  #\null)
-(define ctrl-a    #\u1)
-(define ctrl-e    #\u5)
-(define tab       #\tab)
-(define ctrl-k    #\ub)
-(define ctrl-l    #\uc)
-(define ctrl-u    #\u15)
-
 (define stdin (current-input-port))
 (define stdout (current-output-port))
 (define stderr (current-error-port))
 (define unsupported-terminals (set "dumb" "cons256" "emacs"))
 (define history-max-length 100)
 (define history '())
-(define original-termios (new-termios))
+(define original-termios (make-termios 0 0 0 0 (make-vector NCCS 0) 0 0))
 (define raw-mode #f)
 (define multi-line-mode #f)
 (define at-exit-handler #f)
@@ -252,7 +200,7 @@
 
 (define (get-columns [in stdin] [out stdout])
   (let/ec return
-    (define ws (new-winsize))
+    (define ws (make-winsize 0 0 0 0))
     (cond
      [(or (= (ioctl 1 TIOCGWINSZ ws) -1)
           (= (winsize-ws_col ws) 0))
@@ -362,7 +310,7 @@
 
    [else ; Go to left, print prompt and buffer, clear rest of line
     (fprintf out "\r~a~a\x1b[0K\r\x1b[~aC"
-             prompt buffer (+ (string-length prompt) (string-length buffer)))]))
+             prompt buffer (+ (string-length prompt) pos))]))
 
 (define (edit prompt [in stdin] [out stdout])
   (let/ec return
@@ -400,22 +348,32 @@
         [#\u6 (edit-move-right! state) (loop)]           ; ctrl-f
         [#\u10 (edit-history-next! state 'prev) (loop)]   ; ctrl-p
         [#\ue (edit-history-next! state 'next) (loop)]    ; ctrl-n
+        [#\u1 (edit-move-home! state) (loop)]            ; ctrl-a
+        [#\u5 (edit-move-end! state) (loop)]             ; ctrl-e
         [#\u1b ; escape
-         (define x (read-char))
-         (define y (read-char))
-         (define z (and (equal? x #\[) (y . char>=? . #\0) (y . char<=? . #\9)
+         (define a (read-char))
+         (define b (read-char))
+         (define c (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
                         (read-char)))
-         (match* (x y z)
-           [(#\[ #\3 #\~) (edit-delete! state)]           ; delete
-           [(#\[ #\A _) (edit-history-next! state 'prev)] ; up
-           [(#\[ #\B _) (edit-history-next! state 'next)] ; down
-           [(#\[ #\C _) (edit-move-right! state)]         ; right
-           [(#\[ #\D _) (edit-move-left! state)]          ; left
-           [(#\[ #\H _) (edit-move-home! state)]          ; home
-           [(#\[ #\F _) (edit-move-end! state)]           ; end
-           [(#\O #\H _) (edit-move-home! state)]          ; home
-           [(#\O #\F _) (edit-move-end! state)]           ; state
-           [(_ _ _)     (void)])                          ; not supported
+         (define d (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
+                        (equal? c #\;) (read-char)))
+         (define e (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
+                        (equal? c #\;) (read-char)))
+         (match* (a b c d e)
+           [(#\[ #\3 #\~ _ _) (edit-delete! state)]           ; delete
+           [(#\[ #\A _ _ _) (edit-history-next! state 'prev)] ; up
+           [(#\[ #\B _ _ _) (edit-history-next! state 'next)] ; down
+           [(#\[ #\1 #\; #\2 #\A) (edit-history-next! state 'prev)] ; up
+           [(#\[ #\1 #\; #\2 #\B) (edit-history-next! state 'next)] ; down
+           [(#\[ #\C _ _ _) (edit-move-right! state)]         ; right
+           [(#\[ #\D _ _ _) (edit-move-left! state)]          ; left
+           [(#\[ #\1 #\; #\2 #\C) (edit-move-right! state)]         ; right
+           [(#\[ #\1 #\; #\2 #\D) (edit-move-left! state)]          ; left
+           [(#\[ #\H _ _ _) (edit-move-home! state)]          ; home
+           [(#\[ #\F _ _ _) (edit-move-end! state)]           ; end
+           [(#\O #\H _ _ _) (edit-move-home! state)]          ; home
+           [(#\O #\F _ _ _) (edit-move-end! state)]           ; state
+           [(_ _ _ _ _)     (void)])                          ; not supported
          (loop)]
         [else (edit-insert! state c) (loop)]))
     (le-state-buffer state)))
@@ -572,7 +530,7 @@
       (edit-insert! state #\e)
       (refresh-line! state)
       (void (disable-raw-mode))))
-   "ys\rfoo>ys\e[0K\r\e[6C\rfoo>yes\e[0K\r\e[7C\rfoo>yes\e[0K\r\e[7C")
+   "ys\rfoo>ys\e[0K\r\e[5C\rfoo>yes\e[0K\r\e[6C\rfoo>yes\e[0K\r\e[6C")
   (check-equal? ; cat
    (call-with-output-string
     (lambda (stdout)
@@ -589,6 +547,6 @@
       (edit-insert! state #\t)
       (refresh-line! state)
       (void (disable-raw-mode))))
-   "o\rfoo>o\e[0K\r\e[5C\rfoo>ao\e[0K\r\e[6C\rfoo>a\e[0K\r\e[5C\rfoo>a\e[0K\r\e[5C\rfoo>ca\e[0K\r\e[6C\rfoo>ca\e[0K\r\e[6Ct\rfoo>cat\e[0K\r\e[7C")
+   "o\rfoo>o\e[0K\r\e[4C\rfoo>ao\e[0K\r\e[5C\rfoo>a\e[0K\r\e[5C\rfoo>a\e[0K\r\e[4C\rfoo>ca\e[0K\r\e[5C\rfoo>ca\e[0K\r\e[6Ct\rfoo>cat\e[0K\r\e[7C")
    )
 
