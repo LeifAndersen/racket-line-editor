@@ -272,16 +272,15 @@
   (define len (le-state-len state))
   (cond
    [multi-line-mode
-    (define rows (/ (+ (string-length prompt) columns -1) columns))
-    (define rpos (/ (+ (string-length prompt) old-pos columns -1) columns))
+    (define rows (floor (/ (+ (string-length prompt) columns -1) columns)))
+    (define rpos (floor (/ (+ (string-length prompt) old-pos columns -1) columns)))
 
     ;; Go to the last row
     (when (rows . > . rpos)
-      (fprintf out "\x1b[~aB"
-               (- rows rpos)))
+      (fprintf out "\x1b[~aB" (- rows rpos)))
 
     ;; Clear every row
-    (for ([j (in-range old-rows)])
+    (for ([j (in-range (- old-rows 1))])
       (display "\r\x1b[0K\x1b[1A" out))
 
     ;; Clear the top line
@@ -297,10 +296,10 @@
       (set! rows (+ rows 1)))
 
     ;; Move cursor to correct position
-    (define rpos* (/ (+ (string-length prompt) pos columns) columns))
+    (define rpos* (floor (/ (+ (string-length prompt) pos columns) columns)))
     (when (rows . > . rpos*)
       (fprintf out "\x1b[~aA" (- rows rpos*)))
-    (define col (modulo (+ (string-length prompt)) columns))
+    (define col (modulo (+ (string-length prompt) pos) columns))
     (if (col . > . 0)
         (fprintf out "\r\x1b[~aC" col)
         (display "\r" out))
