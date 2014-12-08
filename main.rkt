@@ -14,42 +14,12 @@
          racket/format
          racket/string
          ffi/unsafe
-         ffi/unsafe/define)
+         ffi/unsafe/define
+         "private/tty-raw-extension")
 
 ;; Based on liblinenoise: https://github.com/antirez/linenoise
 
 (module+ test (require rackunit))
-
-(define STDIN_FILENO 0)
-(define VMIN 16)
-(define VTIME 17)
-
-(define TCSAFLUSH  #x2)
-
-(define _tcflag_t _ulong)
-(define BRKINT      #x2)       ; Input
-(define INPCK       #x10)
-(define ISTRIP      #x20)
-(define ICRNL       #x100)
-(define IXON        #x200)
-(define OPOST       #x1)       ; Output
-(define CS8         #x300)     ; Control
-(define ECHO        #x8)       ; Local
-(define ISIG        #x80)
-(define ICANON      #x100)
-(define IEXTEN      #x400)
-
-(define _cc_t _ubyte)
-(define _speed_t _ulong)
-(define NCCS 20)
-
-(define-cstruct _termios ([c_iflag _tcflag_t]
-                          [c_oflag _tcflag_t]
-                          [c_cflag _tcflag_t]
-                          [c_lflag _tcflag_t]
-                          [c_cc (_array/vector _cc_t NCCS)]
-                          [c_ispeed _speed_t]
-                          [c_ospeed _speed_t]))
 
 (define-cstruct _winsize ([ws_row    _ushort]
                           [ws_col    _ushort]
@@ -65,12 +35,9 @@
   (_IOC IOC_OUT g n (ctype-sizeof t)))
 (define TIOCGWINSZ (_IOR (char->integer #\t) 104 _winsize))
 
-(define-ffi-definer define-libc (ffi-lib "libc"))
+(define-ffi-definer define-libc (ffi-lib "libc" '("6" "5" #f)))
 (define interfaces (make-hash))
 
-(define-libc tcsetattr (_fun _int _int _termios-pointer -> _int))
-(define-libc tcgetattr (_fun _int _termios-pointer -> _int))
-(define-libc isatty (_fun _int -> _int))
 (define (ioctl fildes request . args)
   (define itypes (list* _int _ulong
                         (map
@@ -103,7 +70,6 @@
 (define unsupported-terminals (set "dumb" "cons256" "emacs"))
 (define history-max-length 100)
 (define history '())
-(define original-termios (make-termios 0 0 0 0 (make-vector NCCS 0) 0 0))
 (define raw-mode #f)
 (define multi-line-mode #f)
 (define at-exit-handler #f)
@@ -126,9 +92,9 @@
   (file-stream-buffer-mode stdout 'none)
   (cond
    [(and (supported-terminal?) (terminal-port? stdin)
-         (enable-raw-mode STDIN_FILENO))
+         (tty-raw!))
     (define out (edit prompt stdin))
-    (disable-raw-mode STDIN_FILENO)
+    (tty-restore!)
     (newline)
     out]
    [else (display prompt)
@@ -168,36 +134,6 @@
   (and terminal
        (not (set-member? unsupported-terminals terminal))))
 
-(define (enable-raw-mode [file STDIN_FILENO])
-  (let/ec return
-    ;;(unless (terminal-port? (current-input-port)) (return #f))
-    (when (= (isatty file) 0) (return #f))
-    (unless at-exit-handler
-      (set! at-exit-handler
-            (plumber-add-flush! (current-plumber)
-                                (lambda (x) (disable-raw-mode file)))))
-    (when (= (tcgetattr file original-termios) -1) (return #f))
-    (define raw
-      (make-termios
-       (bitwise-and (bitwise-not (bitwise-ior BRKINT ICRNL INPCK ISTRIP IXON))
-                    (termios-c_iflag original-termios))
-       (bitwise-and (bitwise-not (bitwise-ior OPOST))
-                    (termios-c_oflag original-termios))
-       (bitwise-ior CS8 (termios-c_cflag original-termios))
-       (bitwise-and (bitwise-not (bitwise-ior ECHO ICANON IEXTEN ISIG))
-                    (termios-c_lflag original-termios))
-       (build-vector NCCS (lambda (n) (cond [(equal? n VMIN) 1]
-                                            [(equal? n VTIME) 0]
-                                            [else 0])))
-       0 0))
-    (unless (= (tcsetattr file TCSAFLUSH raw) 0) (return #f))
-    (set! raw-mode #t)
-    #t))
-
-(define (disable-raw-mode [file STDIN_FILENO])
-  (when (and raw-mode (tcsetattr file TCSAFLUSH original-termios))
-    (set! raw-mode #f)))
-
 (define (get-columns [in stdin] [out stdout])
   (let/ec return
     (define ws (make-winsize 0 0 0 0))
@@ -215,7 +151,7 @@
 
       ;; Restore potion
       (fprintf out "\x1b[~aD" (- (second cols) (second start)))
-      cols]
+      (second cols)]
      [else (winsize-ws_col ws)])))
 
 (define (get-cursor-position [in stdin] [out stdout])
@@ -227,7 +163,9 @@
          (equal? (string-ref pos 1) #\[)
          (equal? (string-ref pos (- (string-length pos) 1)) #\R))
     (define pos* (substring pos 2 (- (string-length pos) 1)))
-    (string-split pos* ";")]
+    (define split (string-split pos* ";"))
+    (for/list ([i split])
+      (string->number i))]
    [else #f]))
 
 (define (complete-line! state)
@@ -461,38 +399,49 @@
     (refresh-line! state)]))
 
 (module+ test
+  (check-true ; Get Cursor Position
+   (let ([cols
+          (let ()
+            (file-stream-buffer-mode (current-input-port) 'none)
+            (file-stream-buffer-mode (current-output-port) 'none)
+            (void (tty-raw!))
+            (define cols (get-cursor-position))
+            (void (tty-restore!))
+            cols)])
+     (and (pair? cols) (number? (first cols)) (= (length cols) 2)
+        (number? (second cols)))))
   (check-true ; Get columns
    (< 0
       (let ()
         (file-stream-buffer-mode (current-input-port) 'none)
         (file-stream-buffer-mode (current-output-port) 'none)
-        (void (enable-raw-mode))
+        (void (tty-raw!))
         (define cols (get-columns))
-        (void (disable-raw-mode))
+        (void (tty-restore!))
         cols)))
   (check-true ; Get cursor position
    (pair?
     (let ()
       (file-stream-buffer-mode (current-input-port) 'none)
       (file-stream-buffer-mode (current-output-port) 'none)
-      (void (enable-raw-mode))
+      (void (tty-raw!))
       (define x (get-cursor-position))
-      (void (disable-raw-mode))
+      (void (tty-restore!))
       x)))
   (check-equal? ; Display prompt
    (call-with-output-string
     (lambda (stdout)
       (file-stream-buffer-mode stdin 'none)
-      (void (enable-raw-mode))
+      (void (tty-raw!))
       (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
       (refresh-line! state)
-      (void (disable-raw-mode))))
+      (void (tty-restore!))))
    "\rfoo>\e[0K\r\e[4C")
   (check-equal? ; type characters
    (call-with-output-string
     (lambda (stdout)
       (file-stream-buffer-mode stdin 'none)
-      (void (enable-raw-mode))
+      (void (tty-raw!))
       (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
       (edit-insert! state #\h)
       (edit-insert! state #\e)
@@ -500,13 +449,13 @@
       (edit-insert! state #\l)
       (edit-insert! state #\o)
       (refresh-line! state)
-      (void (disable-raw-mode))))
+      (void (tty-restore!))))
    "hello\rfoo>hello\e[0K\r\e[9C")
   (check-equal? ; Backspace
    (call-with-output-string
     (lambda (stdout)
       (file-stream-buffer-mode stdin 'none)
-      (void (enable-raw-mode))
+      (void (tty-raw!))
       (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
       (edit-insert! state #\y)
       (edit-insert! state #\e)
@@ -515,26 +464,26 @@
       (edit-insert! state #\n)
       (edit-insert! state #\o)
       (refresh-line! state)
-      (void (disable-raw-mode))))
+      (void (tty-restore!))))
    "ye\rfoo>y\e[0K\r\e[5C\rfoo>\e[0K\r\e[4Cno\rfoo>no\e[0K\r\e[6C")
   (check-equal? ; left arrow key
    (call-with-output-string
     (lambda (stdout)
       (file-stream-buffer-mode stdin 'none)
-      (void (enable-raw-mode))
+      (void (tty-raw!))
       (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
       (edit-insert! state #\y)
       (edit-insert! state #\s)
       (edit-move-left! state)
       (edit-insert! state #\e)
       (refresh-line! state)
-      (void (disable-raw-mode))))
+      (void (tty-restore!))))
    "ys\rfoo>ys\e[0K\r\e[5C\rfoo>yes\e[0K\r\e[6C\rfoo>yes\e[0K\r\e[6C")
   (check-equal? ; cat
    (call-with-output-string
     (lambda (stdout)
       (file-stream-buffer-mode stdin 'none)
-      (void (enable-raw-mode))
+      (void (tty-raw!))
       (define state (le-state stdin stdout "" "foo>" 0 0 0 (get-columns stdin) 0 0))
       (edit-insert! state #\o)
       (edit-move-left! state)
@@ -545,7 +494,7 @@
       (edit-move-right! state)
       (edit-insert! state #\t)
       (refresh-line! state)
-      (void (disable-raw-mode))))
+      (void (tty-restore!))))
    "o\rfoo>o\e[0K\r\e[4C\rfoo>ao\e[0K\r\e[5C\rfoo>a\e[0K\r\e[5C\rfoo>a\e[0K\r\e[4C\rfoo>ca\e[0K\r\e[5C\rfoo>ca\e[0K\r\e[6Ct\rfoo>cat\e[0K\r\e[7C")
    )
 
