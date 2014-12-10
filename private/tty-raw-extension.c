@@ -35,7 +35,7 @@ static int ttyraw(void) {
   is_raw = 1;
   return 0;
 }
-	
+
 static int ttyrestore(void) {
   if (!is_raw) return 0;
 
