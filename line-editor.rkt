@@ -2,6 +2,7 @@
 
 (provide line-editor
          history-add
+         history-drop
          history-save
          history-load
          history-max-length
@@ -12,7 +13,6 @@
 
 (require racket/set
          racket/list
-         racket/vector
          racket/file
          racket/port
          racket/match
@@ -42,10 +42,12 @@
   (make-parameter 100 (lambda (new-length)
                         (history-trim (history-max-length))
                         new-length)))
+(define keep-duplicates  (make-parameter #f))
+(define keep-blanks      (make-parameter #f))
 (define unsupported-terminals (set "dumb" "cons256" "emacs"))
 (define multi-line-mode (make-parameter #t))
 (define completion-callback (make-parameter (lambda (stub) '())))
-(define current-prompt (make-parameter "> "))
+(define current-prompt (make-parameter #"> "))
 (define stdin (current-input-port))
 (define stdout (current-output-port))
 (define stderr (current-error-port))
@@ -66,9 +68,31 @@
          (flush-output)
          (read-line stdin)]))
 
-(define (history-add line)
-  (set! history (cons line history))
-  (history-trim))
+(define (history-add s [force-keep? #f])
+  (define keep (or force-keep? (keep-duplicates)))
+  (when (and (bytes? s)
+             (or force-keep? (keep-blanks) (not (zero? (bytes-length s)))))
+    ;; remove duplicate (keep-blanks determines how we search)
+    (unless (or (null? history) (eq? #t keep))
+      (define dup (let loop ([n -1] [h history] [r '()])
+                    (cond [(null? h) #f]
+                          [(equal? (car h) s) `(,n ,@(reverse r) ,@(cdr h))]
+                          [(eq? keep 'unconsecutive) #f] ; no loop
+                          [else (loop (sub1 n) (cdr h) (cons (car h) r))])))
+      (when dup
+        (set! history (cdr dup))))
+    (set! history (cons s history))
+    (history-trim)))
+
+;; remove `l' items from `local-history', ignoring ones that are not
+;; in the front of the history (in the eq? sense)
+(define (history-drop l)
+  (let loop ([l l] [h history])
+    (if (and (pair? l) (pair? h))
+        (if (eq? (car l) (car h))
+            (loop (cdr l) (cdr h))
+            (loop (cdr l) h))
+      (set! history h))))
 
 (define (history-save [file #f])
   (put-preferences '(line-editor-history) (list history) #f file))
@@ -87,11 +111,11 @@
        (not (set-member? unsupported-terminals terminal))))
 
 (define (read-response [port stdin])
-  (let loop ([acc ""])
-    (define x (read-char))
+  (let loop ([acc #""])
+    (define x (read-byte))
     (cond [(eof-object? x) x]
-          [else (define acc* (string-append acc (~a x)))
-                (if (equal? x #\R)
+          [else (define acc* (bytes-append acc (~a x)))
+                (if (equal? (integer->char x) #\R)
                     acc*
                     (loop acc*))])))
 
@@ -120,11 +144,11 @@
   (define pos (read-response in))
   (cond
    [(eof-object? pos) #f]
-   [(and (equal? (string-ref pos 0) #\u001B)
-         (equal? (string-ref pos 1) #\[)
-         (equal? (string-ref pos (- (string-length pos) 1)) #\R))
-    (define pos* (substring pos 2 (- (string-length pos) 1)))
-    (define split (string-split pos* ";"))
+   [(and (equal? (bytes-ref pos 0) #\u001B)
+         (equal? (bytes-ref pos 1) #\[)
+         (equal? (bytes-ref pos (- (bytes-length pos) 1)) #\R))
+    (define pos* (subbytes pos 2 (- (bytes-length pos) 1)))
+    (define split (string-split (bytes->string/locale pos*) ";"))
     (for/list ([i split])
       (string->number i))]
    [else #f]))
@@ -141,8 +165,8 @@
                     #f]))
       (cond [item
              (define saved (struct-copy le-state state))
-             (set-le-state-len! state (string-length item))
-             (set-le-state-pos! state (string-length item))
+             (set-le-state-len! state (bytes-length item))
+             (set-le-state-pos! state (bytes-length item))
              (set-le-state-buffer! state item)
              (refresh-line! state)
              (set-le-state-len! state (le-state-len saved))
@@ -150,15 +174,15 @@
              (set-le-state-buffer! state (le-state-buffer saved))]
             [else
              (refresh-line! state)])
-      (match (read-char (le-state-in state))
-        [#\tab (loop (modulo (+ i 1) (+ (length completions) 1)))]
-        [#\u1b (when item (refresh-line! state))]                ; escape
+      (match (read-byte (le-state-in state))
+        [#x9 (loop (modulo (+ i 1) (+ (length completions) 1)))] ; tab
+        [#x1b (when item (refresh-line! state))]                 ; escape
         [else
          (when item
            (set-le-state-buffer! state item)
-           (set-le-state-len! state (string-length item))
-           (set-le-state-pos! state (string-length item)))])
-      (string-ref item (- (string-length item) 1)))]))
+           (set-le-state-len! state (bytes-length item))
+           (set-le-state-pos! state (bytes-length item)))])
+      (bytes-ref item (- (bytes-length item) 1)))]))
 
 (define (refresh-line! state)
   (define out (le-state-out state))
@@ -171,8 +195,8 @@
   (define len (le-state-len state))
   (cond
    [(multi-line-mode)
-    (define rows (floor (/ (+ (string-length prompt) columns -1) columns)))
-    (define rpos (floor (/ (+ (string-length prompt) old-pos columns -1) columns)))
+    (define rows (floor (/ (+ (bytes-length prompt) columns -1) columns)))
+    (define rpos (floor (/ (+ (bytes-length prompt) old-pos columns -1) columns)))
 
     ;; Go to the last row
     (when (rows . > . rpos)
@@ -190,15 +214,15 @@
 
     ;; If at end of screen, emit newline
     (when (and (equal? pos len)
-               (= (modulo (+ pos (string-length prompt)) columns) 0))
+               (= (modulo (+ pos (bytes-length prompt)) columns) 0))
       (display "\n\r" out)
       (set! rows (+ rows 1)))
 
     ;; Move cursor to correct position
-    (define rpos* (floor (/ (+ (string-length prompt) pos columns) columns)))
+    (define rpos* (floor (/ (+ (bytes-length prompt) pos columns) columns)))
     (when (rows . > . rpos*)
       (fprintf out "\x1b[~aA" (- rows rpos*)))
-    (define col (modulo (+ (string-length prompt) pos) columns))
+    (define col (modulo (+ (bytes-length prompt) pos) columns))
     (if (col . > . 0)
         (fprintf out "\r\x1b[~aC" col)
         (display "\r" out))
@@ -208,56 +232,56 @@
 
    [else ; Go to left, print prompt and buffer, clear rest of line
     (fprintf out "\r~a~a\x1b[0K\r\x1b[~aC"
-             prompt buffer (+ (string-length prompt) pos))]))
+             prompt buffer (+ (bytes-length prompt) pos))]))
 
 (define (edit prompt [in stdin] [out stdout])
   (let/ec return
-    (define state (le-state in out "" prompt 0 0 0 (get-columns in out) 0 0))
-    (history-add "")
+    (define state (le-state in out #"" prompt 0 0 0 (get-columns in out) 0 0))
+    (history-add #"" #t)
     (display prompt out)
     (let loop ()
-      (define c (read-char in))
+      (define c (read-byte in))
       (when (eof-object? c) (return (le-state-len state)))
-      (when (equal? c #\tab)
+      (when (equal? c #x9)                              ; tab
         (set! c (complete-line! state)))
       (match c
-        [#\ud                                            ; enter
+        [#xd                                            ; enter
          (history-add (le-state-buffer state))
          (when (multi-line-mode) (edit-move-end! state))
          (display "\n\r" out)]
-        [#\u3 (exit 130)]                                ; ctrl-c
-        [(or #\u8 #\u7f) (edit-backspace! state) (loop)] ; ctr-h or backspace
-        [#\u4                                            ; ctrl-d
+        [#x3 (exit 130)]                                ; ctrl-c
+        [(or #x8 #x7f) (edit-backspace! state) (loop)] ; ctr-h or backspace
+        [#x4                                            ; ctrl-d
          (cond [((le-state-len state) . > . 0) (edit-delete! state) (loop)]
                [else (set! history (take history (- (length history) 1)))
                      eof])]
-        [#\u14                                           ; ctrl-t
+        [#x14                                           ; ctrl-t
          (when (and ((le-state-pos state) . > . 0)
                     ((le-state-pos state) . < . (le-state-len state)))
            (define str (le-state-buffer state))
            (define pos (le-state-pos state))
-           (define aux (string-ref str (- pos 1)))
-           (string-set! str (- pos 1) (string-ref str pos))
-           (string-set! str pos aux)
+           (define aux (bytes-ref str (- pos 1)))
+           (bytes-set! str (- pos 1) (bytes-ref str pos))
+           (bytes-set! str pos aux)
            (when (not (= pos (- (le-state-len state) 1)))
              (set-le-state-pos! state (+ pos 1)))
            (refresh-line! state))
          (loop)]
-        [#\u2 (edit-move-left! state) (loop)]            ; ctrl-b
-        [#\u6 (edit-move-right! state) (loop)]           ; ctrl-f
-        [#\u10 (edit-history-next! state 'prev) (loop)]   ; ctrl-p
-        [#\ue (edit-history-next! state 'next) (loop)]    ; ctrl-n
-        [#\u1 (edit-move-home! state) (loop)]            ; ctrl-a
-        [#\u5 (edit-move-end! state) (loop)]             ; ctrl-e
-        [#\u1b ; escape
-         (define a (read-char))
-         (define b (read-char))
+        [#x2 (edit-move-left! state) (loop)]            ; ctrl-b
+        [#x6 (edit-move-right! state) (loop)]           ; ctrl-f
+        [#x10 (edit-history-next! state 'prev) (loop)]   ; ctrl-p
+        [#xe (edit-history-next! state 'next) (loop)]    ; ctrl-n
+        [#x1 (edit-move-home! state) (loop)]            ; ctrl-a
+        [#x5 (edit-move-end! state) (loop)]             ; ctrl-e
+        [#x1b ; escape
+         (define a (integer->char (read-byte)))
+         (define b (integer->char (read-byte)))
          (define c (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
-                        (read-char)))
+                        (integer->char (read-byte))))
          (define d (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
-                        (equal? c #\;) (read-char)))
+                        (equal? c #\;) (integer->char (read-byte))))
          (define e (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
-                        (equal? c #\;) (read-char)))
+                        (equal? c #\;) (integer->char (read-byte))))
          (match* (a b c d e)
            [(#\[ #\3 #\~ _ _) (edit-delete! state)]           ; delete
            [(#\[ #\A _ _ _) (edit-history-next! state 'prev)] ; up
@@ -293,9 +317,9 @@
     (set-le-state-len! state (- (le-state-len state) 1))
     (let ([pos (le-state-pos state)]
           [buf (le-state-buffer state)])
-      (set-le-state-buffer! state (string-append
-                                   (substring buf 0 pos)
-                                   (substring buf (+ pos 1) (string-length buf)))))
+      (set-le-state-buffer! state (bytes-append
+                                   (subbytes buf 0 pos)
+                                   (subbytes buf (+ pos 1) (bytes-length buf)))))
     (refresh-line! state)))
 
 (define (edit-delete! state)
@@ -304,9 +328,9 @@
     (set-le-state-len! state (- (le-state-len state) 1))
     (let ([pos (le-state-pos state)]
           [buf (le-state-buffer state)])
-      (set-le-state-buffer! state (string-append
-                                   (substring buf 0 pos)
-                                   (substring buf (+ pos 1) (string-length buf)))))
+      (set-le-state-buffer! state (bytes-append
+                                   (subbytes buf 0 pos)
+                                   (subbytes buf (+ pos 1) (bytes-length buf)))))
     (refresh-line! state)))
 
 (define (edit-move-left! state)
@@ -320,10 +344,6 @@
     (refresh-line! state)))
 
 (define (edit-history-next! state direction)
-  (define h-index (le-state-history-index state))
-  (set! history `(,@(take history h-index)
-                  ,(le-state-buffer state)
-                  ,@(drop history (+ h-index 1))))
   (define new-index (+ (le-state-history-index state)
                        (match direction ['next 1] ['prev -1])))
   (cond
@@ -331,11 +351,15 @@
    [(new-index . >= . (length history))
     (set-le-state-history-index! state (- (length history) 1))]
    [else
-    (set-le-state-history-index! state new-index)
+    (define h-index (le-state-history-index state))
     (define new-text (list-ref history new-index))
+    (set! history `(,@(take history h-index)
+                    ,(le-state-buffer state)
+                    ,@(drop history (+ h-index 1))))
+    (set-le-state-history-index! state new-index)
     (set-le-state-buffer! state new-text)
-    (set-le-state-len! state (string-length new-text))
-    (set-le-state-pos! state (string-length new-text))
+    (set-le-state-len! state (bytes-length new-text))
+    (set-le-state-pos! state (bytes-length new-text))
     (refresh-line! state)]))
 
 (define (edit-insert! state character)
@@ -344,18 +368,18 @@
   (define buf (le-state-buffer state))
   (cond
    [(= len pos)
-    (set-le-state-buffer! state (string-append buf (string character)))
+    (set-le-state-buffer! state (bytes-append buf (bytes character)))
     (set-le-state-pos! state (+ pos 1))
     (set-le-state-len! state (+ len 1))
     (if (and (not (multi-line-mode))
-             ((string-length (le-state-prompt state)) . < . (le-state-columns state)))
-        (display character (le-state-out state))
+             ((bytes-length (le-state-prompt state)) . < . (le-state-columns state)))
+        (display (bytes character) (le-state-out state))
         (refresh-line! state))]
    [else
-    (set-le-state-buffer! state (string-append
-                                 (substring buf 0 pos)
-                                 (string character)
-                                 (substring buf pos (string-length buf))))
+    (set-le-state-buffer! state (bytes-append
+                                 (subbytes buf 0 pos)
+                                 (bytes character)
+                                 (subbytes buf pos (string-length buf))))
     (set-le-state-pos! state (+ pos 1))
     (set-le-state-len! state (+ len 1))
     (refresh-line! state)]))
