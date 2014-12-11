@@ -52,26 +52,25 @@
 (define stdout (current-output-port))
 (define stderr (current-error-port))
 
-(define (line-editor [out stdout])
+(define (line-editor [out stdout] #:prompt [prompt (current-prompt)])
   (define in-fsb (file-stream-buffer-mode stdin))
   (define out-fsb (file-stream-buffer-mode out))
   (cond [(and (supported-terminal?) (terminal-port? stdin)
               (begin (file-stream-buffer-mode stdin 'none)
                      (file-stream-buffer-mode out 'none)
                      (tty-raw!)))
-         (define res (edit (current-prompt) stdin))
+         (define res (edit prompt stdin))
          (tty-restore!)
          (file-stream-buffer-mode stdin in-fsb)
          (file-stream-buffer-mode out out-fsb)
          res]
-   [else (display (current-prompt))
+   [else (display prompt)
          (flush-output)
          (read-line stdin)]))
 
 (define (history-add s [force-keep? #f])
   (define keep (or force-keep? (keep-duplicates)))
-  (when (and (bytes? s)
-             (or force-keep? (keep-blanks) (not (zero? (bytes-length s)))))
+  (when (and (bytes? s) (or (keep-blanks) (not (zero? (bytes-length s)))))
     ;; remove duplicate (keep-blanks determines how we search)
     (unless (or (null? history) (eq? #t keep))
       (define dup (let loop ([n -1] [h history] [r '()])
@@ -112,7 +111,7 @@
 
 (define (read-response [port stdin])
   (let loop ([acc '()])
-    (define x (read-byte))
+    (define x (read-byte port))
     (cond [(eof-object? x) x]
           [else (define acc* (cons x acc))
                 (if (equal? (integer->char x) #\R)
@@ -237,7 +236,6 @@
 (define (edit prompt [in stdin] [out stdout])
   (let/ec return
     (define state (le-state in out #"" prompt 0 0 0 (get-columns in out) 0 0))
-    (history-add #"" #t)
     (display prompt out)
     (let loop ()
       (define c (read-byte in))
@@ -246,7 +244,6 @@
         (set! c (complete-line! state)))
       (match c
         [#xd                                            ; enter
-         (history-add (le-state-buffer state))
          (when (multi-line-mode) (edit-move-end! state))
          (display "\n\r" out)]
         [#x3 (exit 130)]                                ; ctrl-c
@@ -274,14 +271,14 @@
         [#x1 (edit-move-home! state) (loop)]            ; ctrl-a
         [#x5 (edit-move-end! state) (loop)]             ; ctrl-e
         [#x1b ; escape
-         (define a (integer->char (read-byte)))
-         (define b (integer->char (read-byte)))
+         (define a (integer->char (read-byte in)))
+         (define b (integer->char (read-byte in)))
          (define c (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
-                        (integer->char (read-byte))))
+                        (integer->char (read-byte in))))
          (define d (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
-                        (equal? c #\;) (integer->char (read-byte))))
+                        (equal? c #\;) (integer->char (read-byte in))))
          (define e (and (equal? a #\[) (b . char>=? . #\0) (b . char<=? . #\9)
-                        (equal? c #\;) (integer->char (read-byte))))
+                        (equal? c #\;) (integer->char (read-byte in))))
          (match* (a b c d e)
            [(#\[ #\3 #\~ _ _) (edit-delete! state)]           ; delete
            [(#\[ #\A _ _ _) (edit-history-next! state 'prev)] ; up
