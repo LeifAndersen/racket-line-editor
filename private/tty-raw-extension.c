@@ -1,4 +1,7 @@
 /* PLT Racket extension for selecting "raw" TTY mode */
+/* Copyright (C) 2011 Tony Garnock-Jones */
+/* Licensed under the LGPL v3 or later. */
+/* Originally written as part of https://github.com/tonyg/racket-ansi */
 
 #include "escheme.h"
 
