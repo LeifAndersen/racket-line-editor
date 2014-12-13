@@ -111,12 +111,12 @@
        (not (set-member? unsupported-terminals terminal))))
 
 (define (read-response [port stdin])
-  (let loop ([acc #""])
+  (let loop ([acc '()])
     (define x (read-byte))
     (cond [(eof-object? x) x]
-          [else (define acc* (bytes-append acc (~a x)))
+          [else (define acc* (cons x acc))
                 (if (equal? (integer->char x) #\R)
-                    acc*
+                    (list->bytes (reverse acc*))
                     (loop acc*))])))
 
 (define (get-columns [in stdin] [out stdout])
