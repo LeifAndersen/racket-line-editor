@@ -22,7 +22,10 @@ static int ttyraw(void) {
 
   if (is_raw) return 0;
 
-  if (tcgetattr(STDIN_FD, &saved) < 0) return -1;
+  if (tcgetattr(STDIN_FD, &saved) < 0) {
+    perror("tcgetattr (saving tty settings)");
+    return -1;
+  }
   t = saved;
 
   t.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
@@ -33,7 +36,10 @@ static int ttyraw(void) {
   t.c_cc[VMIN] = 1;
   t.c_cc[VTIME] = 0;
 
-  if (tcsetattr(STDIN_FD, TCSAFLUSH, &t) < 0) return -1;
+  if (tcsetattr(STDIN_FD, TCSAFLUSH, &t) < 0) {
+    perror("tcsetattr (enabling raw mode)");
+    return -1;
+  }
 
   is_raw = 1;
   return 0;
@@ -42,7 +48,10 @@ static int ttyraw(void) {
 static int ttyrestore(void) {
   if (!is_raw) return 0;
 
-  if (tcsetattr(STDIN_FD, TCSAFLUSH, &saved) < 0) return -1;
+  if (tcsetattr(STDIN_FD, TCSAFLUSH, &saved) < 0) {
+    perror("tcsetattr (restoring tty settings)");
+    return -1;
+  }
 
   is_raw = 0;
   return 0;
