@@ -1,6 +1,6 @@
 #lang info
 
-(define collection "line-editor")
+(define collection 'multi)
 
 (define deps '("base"
                "rackunit-lib"
